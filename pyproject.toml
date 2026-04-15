@@ -17,6 +17,14 @@ python-dotenv = "^1.0.0"
 pytest = "^7.4.3"
 ruff = "^0.2.2"
 
+[tool.poetry.plugins."napalm.drivers"]
+"unifi.uap" = "napalm_unifi.uap:UnifiAccessPointDriver"
+"unifi.udm" = "napalm_unifi.udm:UnifiDreamMachineDriver"
+"unifi.usg" = "napalm_unifi.usg:UnifiSecurityGatewayDriver"
+"unifi.usw" = "napalm_unifi.usw:UnifiSwitchDriver"
+"unifi.usw_flex" = "napalm_unifi.usw_flex:UnifiSwitchFlexDriver"
+"unifi.usw_lite" = "napalm_unifi.usw_lite:UnifiSwitchLiteDriver"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

@@ -96,7 +96,15 @@ class UnifiBaseDriver(NetworkDriver, ABC):
 
     def close(self):
         """Implement the NAPALM method close (mandatory)"""
+        self._mca = None
         self._netmiko_close()
+
+    def _get_mca(self) -> dict:
+        """Return mca-dump as a dict, cached for the duration of the session."""
+        if self._mca is None:
+            raw = self._netmiko_device.send_command("mca-dump", read_timeout=60)
+            self._mca = parse_mca_dump(raw)
+        return self._mca
 
     def _get_config(self, retrieve: str = "all", full: bool = False, sanitized: bool = False, use_previous: bool = False) -> models.ConfigDict:
         if use_previous:
@@ -117,8 +125,7 @@ class UnifiBaseDriver(NetworkDriver, ABC):
         return self._get_config(retrieve, full, sanitized)
 
     def get_facts(self) -> models.FactsDict:
-        raw = self._netmiko_device.send_command("mca-dump", read_timeout=60)
-        mca = parse_mca_dump(raw)
+        mca = self._get_mca()
 
         return {
             "fqdn": "",
@@ -208,6 +215,27 @@ class UnifiBaseDriver(NetworkDriver, ABC):
                 except ValueError:
                     pass  # Ignore bad speed parsing
         return interfaces
+
+
+    def get_environment(self) -> models.EnvironmentDict:
+        mca = self._get_mca()
+        env: models.EnvironmentDict = {
+            "fans": {},
+            "temperature": {},
+            "power": {},
+            "cpu": {},
+            "memory": {},
+        }
+        if mca.get("has_temperature"):
+            overheating = mca.get("overheating", False)
+            env["temperature"]["system"] = {
+                "temperature": float(mca.get("general_temperature", 0)),
+                "is_alert": overheating,
+                "is_critical": overheating,
+            }
+        if mca.get("has_fan"):
+            env["fans"]["fan0"] = {"status": True}
+        return env
 
 
 class UnifiConfigMixin:
@@ -355,8 +383,7 @@ class UnifiSwitchBase(NoEnableMixin, UnifiConfigMixin, UnifiBaseDriver):
     def get_ports(self) -> Dict[str, models.InterfaceDict]:
         ports: Dict[str, models.InterfaceDict] = {}
         mtu = 1500
-        raw = self._netmiko_device.send_command("mca-dump", read_timeout=60)
-        mca = parse_mca_dump(raw)
+        mca = self._get_mca()
 
         try:
             if self.get_config_value("switch.jumboframes") == "enabled":
@@ -392,17 +419,32 @@ class UnifiSwitchBase(NoEnableMixin, UnifiConfigMixin, UnifiBaseDriver):
     def get_vlans(self) -> Dict[str, models.VlanDict]:
         vlans: Dict[str, models.VlanDict] = {}
 
-        # Build VLAN list from switch.vlan.{id}.name entries
+        # Build VLAN name map from switch.vlan.{id}.name config entries
         vlan_config = self.get_config_section("switch.vlan", group=True, trim=True)
         for vlan_id, vlan_data in vlan_config.items():
-            vlans[vlan_id] = {
-                "name": vlan_data.get("name", ""),
-                "interfaces": [],
-            }
+            name = (vlan_data.get("name", "") if isinstance(vlan_data, dict) else "") or f"VLAN{vlan_id}"
+            vlans[vlan_id] = {"name": name, "interfaces": []}
 
-        # Collect port VLAN membership from switch.port.{id}.vlan.{vlan_id}=tagged/untagged
+        # Supplement with VLANs observed in mca-dump port_table mac entries (catches
+        # VLANs that are active but have no switch.vlan.* config entry)
+        mca = self._get_mca()
+        for port in mca.get("port_table", []):
+            port_idx = port.get("port_idx")
+            port_name = f"Port {port_idx}" if port_idx is not None else None
+            for mac_entry in port.get("mac_table", []):
+                vlan_id = str(mac_entry.get("vlan", ""))
+                if not vlan_id:
+                    continue
+                if vlan_id not in vlans:
+                    vlans[vlan_id] = {"name": f"VLAN{vlan_id}", "interfaces": []}
+                if port_name and port_name not in vlans[vlan_id]["interfaces"]:
+                    vlans[vlan_id]["interfaces"].append(port_name)
+
+        # Add port VLAN membership from switch.port.{id}.vlan.{vlan_id}=tagged/untagged
         port_config = self.get_config_section("switch.port", group=True, trim=True)
         for port_id, port_data in port_config.items():
+            if not isinstance(port_data, dict):
+                continue
             port_name = f"Port {port_id}"
             vlan_memberships = port_data.get("vlan", {})
             if not isinstance(vlan_memberships, dict):
@@ -412,3 +454,65 @@ class UnifiSwitchBase(NoEnableMixin, UnifiConfigMixin, UnifiBaseDriver):
                     vlans[vlan_id]["interfaces"].append(port_name)
 
         return vlans
+
+    def get_arp_table(self, vrf: str = "") -> List[models.ARPTableDict]:
+        arp_table: List[models.ARPTableDict] = []
+        for port in self._get_mca().get("port_table", []):
+            port_idx = port.get("port_idx")
+            port_name = f"Port {port_idx}" if port_idx is not None else ""
+            for entry in port.get("mac_table", []):
+                ip = entry.get("ip", "")
+                if not ip:
+                    continue
+                arp_table.append({
+                    "interface": port_name,
+                    "mac": entry.get("mac", ""),
+                    "ip": ip,
+                    "age": float(entry.get("age", 0)),
+                })
+        return arp_table
+
+    def get_mac_address_table(self) -> List[models.MACAddrTable]:
+        mac_table: List[models.MACAddrTable] = []
+        for port in self._get_mca().get("port_table", []):
+            port_idx = port.get("port_idx")
+            port_name = f"Port {port_idx}" if port_idx is not None else ""
+            for entry in port.get("mac_table", []):
+                mac_table.append({
+                    "mac": entry.get("mac", ""),
+                    "interface": port_name,
+                    "vlan": entry.get("vlan", 0),
+                    "static": entry.get("static", False),
+                    "active": True,
+                    "moves": 0,
+                    "last_move": 0.0,
+                })
+        return mac_table
+
+    def get_interfaces_counters(self) -> Dict[str, models.InterfaceCounterDict]:
+        counters: Dict[str, models.InterfaceCounterDict] = {}
+        for port in self._get_mca().get("port_table", []):
+            port_idx = port.get("port_idx")
+            if port_idx is None:
+                continue
+            rx_packets = port.get("rx_packets", 0)
+            tx_packets = port.get("tx_packets", 0)
+            rx_broadcast = port.get("rx_broadcast", 0)
+            tx_broadcast = port.get("tx_broadcast", 0)
+            rx_multicast = port.get("rx_multicast", 0)
+            tx_multicast = port.get("tx_multicast", 0)
+            counters[f"Port {port_idx}"] = {
+                "tx_errors": port.get("tx_errors", 0),
+                "rx_errors": port.get("rx_errors", 0),
+                "tx_discards": port.get("tx_dropped", 0),
+                "rx_discards": port.get("rx_dropped", 0),
+                "tx_octets": port.get("tx_bytes", 0),
+                "rx_octets": port.get("rx_bytes", 0),
+                "tx_unicast_packets": max(0, tx_packets - tx_broadcast - tx_multicast),
+                "rx_unicast_packets": max(0, rx_packets - rx_broadcast - rx_multicast),
+                "tx_multicast_packets": tx_multicast,
+                "rx_multicast_packets": rx_multicast,
+                "tx_broadcast_packets": tx_broadcast,
+                "rx_broadcast_packets": rx_broadcast,
+            }
+        return counters
