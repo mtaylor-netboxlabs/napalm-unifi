@@ -7,6 +7,8 @@ Read https://napalm.readthedocs.io for more information.
 from abc import ABC
 from collections import defaultdict
 import json
+import logging
+import os
 import re
 from os import path
 from typing import Any, Dict, List, Union
@@ -23,6 +25,8 @@ local_cli_table = clitable.CliTable("index", template_dir)
 
 template_dir = path.join(path.dirname(ntc_templates.__file__), "templates")
 ntc_cli_table = clitable.CliTable("index", template_dir)
+
+log = logging.getLogger(__name__)
 
 # UniFi devices inject background log messages into SSH sessions.
 # These match the syslog-style prefix format e.g. "[warn ]", "[err  ]", "[info ]"
@@ -98,6 +102,65 @@ class UnifiBaseDriver(NetworkDriver, ABC):
         """Implement the NAPALM method close (mandatory)"""
         self._mca = None
         self._netmiko_close()
+
+    def _push_lldp_cables_to_diode(self):
+        """Ingest LLDP-discovered cable entities into NetBox via the Diode SDK."""
+        target = os.environ.get("DIODE_TARGET", "")
+        if not target:
+            log.debug("DIODE_TARGET not set; skipping LLDP cable push for %s", self.hostname)
+            return
+
+        try:
+            from netboxlabs.diode.sdk import DiodeClient
+            from netboxlabs.diode.sdk.ingester import Cable, CableTermination, Entity, Interface
+        except ImportError:
+            log.warning("netboxlabs-diode-sdk not installed; skipping LLDP cable push")
+            return
+
+        try:
+            neighbors = self.get_lldp_neighbors_detail()
+        except Exception as exc:
+            log.warning("Failed to get LLDP neighbors for %s: %s", self.hostname, exc)
+            return
+
+        if not neighbors:
+            return
+
+        local_hostname = self._get_mca().get("hostname", self.hostname)
+        entities = []
+        for local_port, neighbor_list in neighbors.items():
+            for neighbor in neighbor_list:
+                remote_hostname = neighbor.get("remote_system_name", "")
+                # Prefer the human-readable port description over the raw port ID
+                remote_port = neighbor.get("remote_port_description") or neighbor.get("remote_port", "")
+                if not remote_hostname or not remote_port:
+                    continue
+                cable = Cable(status="connected")
+                term_a = CableTermination(
+                    cable=cable,
+                    cable_end="A",
+                    termination_interface=Interface(device=local_hostname, name=local_port),
+                )
+                term_b = CableTermination(
+                    cable=cable,
+                    cable_end="B",
+                    termination_interface=Interface(device=remote_hostname, name=remote_port),
+                )
+                entities.extend([
+                    Entity(cable=cable),
+                    Entity(cable_termination=term_a),
+                    Entity(cable_termination=term_b),
+                ])
+
+        if not entities:
+            return
+
+        with DiodeClient(target=target, app_name="napalm-unifi", app_version="0.4.0") as client:
+            response = client.ingest(entities=entities)
+            if response.errors:
+                log.warning("Diode LLDP cable ingest errors for %s: %s", self.hostname, response.errors)
+            else:
+                log.info("Pushed %d cable entities to Diode for %s", len(entities), self.hostname)
 
     def _get_mca(self) -> dict:
         """Return mca-dump as a dict, cached for the duration of the session."""
@@ -520,3 +583,11 @@ class UnifiSwitchBase(NoEnableMixin, UnifiConfigMixin, UnifiBaseDriver):
                 "rx_broadcast_packets": rx_broadcast,
             }
         return counters
+
+    def close(self):
+        """Push LLDP cable data to Diode, then close the SSH session."""
+        try:
+            self._push_lldp_cables_to_diode()
+        except Exception as exc:
+            log.warning("Failed to push LLDP cables to Diode for %s: %s", self.hostname, exc)
+        super().close()

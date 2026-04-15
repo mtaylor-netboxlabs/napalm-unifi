@@ -1,9 +1,12 @@
 """NAPALM driver for UniFi Dream Machine (UDM / UDM-Pro / UDM-SE)."""
 
 import json
+import logging
 import re
 from collections import defaultdict
 from typing import Dict, List
+
+log = logging.getLogger(__name__)
 
 from napalm.base import models
 
@@ -31,6 +34,14 @@ class UnifiDreamMachineDriver(NoEnableMixin, UnifiConfigMixin, LLDPCliMixin, _Ba
 
     def get_primary_ipv4(self):
         return self.get_interface_ipv4("br0")
+
+    def close(self):
+        """Push LLDP cable data to Diode, then close the SSH session."""
+        try:
+            self._push_lldp_cables_to_diode()
+        except Exception as exc:
+            log.warning("Failed to push LLDP cables to Diode for %s: %s", self.hostname, exc)
+        super().close()
 
     def lldp_show_neighbors(self):
         return json.loads(self.send_command("lldpcli -f json0 show neighbors details"))

@@ -108,11 +108,15 @@ class UnifiAccessPointDriver(NoEnableMixin, LLDPCliMixin, UnifiConfigMixin, _Bas
         return wlans
 
     def close(self):
-        """Push wireless LAN data to Diode, then close the SSH session."""
+        """Push wireless LAN and LLDP cable data to Diode, then close the SSH session."""
         try:
             self._push_wireless_lans_to_diode()
         except Exception as exc:
-            log.warning("Failed to push wireless LANs to Diode: %s", exc)
+            log.warning("Failed to push wireless LANs to Diode for %s: %s", self.hostname, exc)
+        try:
+            self._push_lldp_cables_to_diode()
+        except Exception as exc:
+            log.warning("Failed to push LLDP cables to Diode for %s: %s", self.hostname, exc)
         super().close()
 
     def _push_wireless_lans_to_diode(self):
@@ -128,6 +132,7 @@ class UnifiAccessPointDriver(NoEnableMixin, LLDPCliMixin, UnifiConfigMixin, _Bas
         """
         target = os.environ.get("DIODE_TARGET", "")
         if not target:
+            log.debug("DIODE_TARGET not set; skipping wireless LAN push for %s", self.hostname)
             return
 
         try:
