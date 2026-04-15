@@ -1,6 +1,6 @@
 Value Required ID (\d+)
 Value Required INTERFACE ([^:]+)
-Value Required FLAGS (\S+)
+Value FLAGS ([^>]*)
 Value Required MTU (\d+)
 Value Required QDISC (\S+)
 Value Required STATE (\S+)

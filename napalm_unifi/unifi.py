@@ -388,3 +388,27 @@ class UnifiSwitchBase(NoEnableMixin, UnifiConfigMixin, UnifiBaseDriver):
         interfaces = super().get_interfaces()
         interfaces.update(self.get_ports())
         return interfaces
+
+    def get_vlans(self) -> Dict[str, models.VlanDict]:
+        vlans: Dict[str, models.VlanDict] = {}
+
+        # Build VLAN list from switch.vlan.{id}.name entries
+        vlan_config = self.get_config_section("switch.vlan", group=True, trim=True)
+        for vlan_id, vlan_data in vlan_config.items():
+            vlans[vlan_id] = {
+                "name": vlan_data.get("name", ""),
+                "interfaces": [],
+            }
+
+        # Collect port VLAN membership from switch.port.{id}.vlan.{vlan_id}=tagged/untagged
+        port_config = self.get_config_section("switch.port", group=True, trim=True)
+        for port_id, port_data in port_config.items():
+            port_name = f"Port {port_id}"
+            vlan_memberships = port_data.get("vlan", {})
+            if not isinstance(vlan_memberships, dict):
+                continue
+            for vlan_id in vlan_memberships:
+                if vlan_id in vlans and port_name not in vlans[vlan_id]["interfaces"]:
+                    vlans[vlan_id]["interfaces"].append(port_name)
+
+        return vlans
