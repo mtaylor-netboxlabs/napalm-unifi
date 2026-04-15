@@ -7,11 +7,13 @@ Read https://napalm.readthedocs.io for more information.
 from abc import ABC
 from collections import defaultdict
 import json
+import re
 from os import path
 from typing import Any, Dict, List, Union
 
 from napalm.base import NetworkDriver, models
 from napalm.base.netmiko_helpers import netmiko_args
+from netmiko.utilities import get_structured_data_textfsm
 
 import ntc_templates
 from textfsm import clitable
@@ -22,8 +24,12 @@ local_cli_table = clitable.CliTable("index", template_dir)
 template_dir = path.join(path.dirname(ntc_templates.__file__), "templates")
 ntc_cli_table = clitable.CliTable("index", template_dir)
 
+# UniFi devices inject background log messages into SSH sessions.
+# These match the syslog-style prefix format e.g. "[warn ]", "[err  ]", "[info ]"
+_UNIFI_LOG_LINE = re.compile(r"^\[(?:warn |err  |info |crit )\]")
 
-def map_textfsm_template(command: str, platform = "ubiquiti_unifi"):
+
+def map_textfsm_template(command: str, platform="ubiquiti_unifi"):
     for table in [local_cli_table, ntc_cli_table]:
         row_idx = table.index.GetRowMatch({
             "Platform": platform,
@@ -31,7 +37,6 @@ def map_textfsm_template(command: str, platform = "ubiquiti_unifi"):
         })
         if row_idx:
             return path.join(table.template_dir, table.index.index[row_idx]['Template'])
-    
     return None
 
 
@@ -40,6 +45,22 @@ def correct_lldp_interface_names(old_prefix: str, new_prefix: str, neighbors: Di
         if interface.startswith(old_prefix):
             neighbors[f"{new_prefix}{interface.removeprefix(old_prefix).strip()}"] = neighbors.pop(interface)
     return neighbors
+
+
+def parse_mca_dump(raw: str) -> dict:
+    """Extract and parse JSON from mca-dump output, stripping any leading prompt/echo or log noise."""
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise ValueError(f"mca-dump returned no parseable JSON content: {raw!r}")
+    return json.loads(raw[start:end])
+
+
+def strip_unifi_log_lines(output: str) -> str:
+    """Remove background syslog lines that UniFi injects into SSH sessions."""
+    lines = [line for line in output.splitlines() if not _UNIFI_LOG_LINE.match(line)]
+    return "\n".join(lines)
+
 
 class UnifiBaseDriver(NetworkDriver, ABC):
     """Napalm driver for Unifi."""
@@ -75,10 +96,6 @@ class UnifiBaseDriver(NetworkDriver, ABC):
 
     def close(self):
         """Implement the NAPALM method close (mandatory)"""
-        # self._netmiko_device.send_command(
-        #     "exit",
-        #     cmd_verify=False,
-        # )
         self._netmiko_close()
 
     def _get_config(self, retrieve: str = "all", full: bool = False, sanitized: bool = False, use_previous: bool = False) -> models.ConfigDict:
@@ -100,31 +117,39 @@ class UnifiBaseDriver(NetworkDriver, ABC):
         return self._get_config(retrieve, full, sanitized)
 
     def get_facts(self) -> models.FactsDict:
-       mca = json.loads(self._netmiko_device.send_command("mca-dump"))
+        raw = self._netmiko_device.send_command("mca-dump", read_timeout=60)
+        mca = parse_mca_dump(raw)
 
-       return {
-           "fqdn": "",
-           "hostname": mca["hostname"],
-           "interface_list": list(self.get_interfaces().keys()),
-           "model": mca["model"],
-           "model_display": mca["model_display"],
-           "os_version": mca["version"],
-           "uptime": mca["uptime"],
-           "serial_number": mca["serial"],
-           "vendor": "Ubiquiti Inc.",
-       }
+        return {
+            "fqdn": "",
+            "hostname": mca["hostname"],
+            "interface_list": list(self.get_interfaces().keys()),
+            "model": mca["model"],
+            "model_display": mca["model_display"],
+            "os_version": mca["version"],
+            "uptime": mca["uptime"],
+            "serial_number": mca["serial"],
+            "vendor": "Ubiquiti Inc.",
+        }
 
     def _read_file(self, file_path):
         return self.send_command(f"cat {file_path}")
 
     def send_command(self, command: str):
+        """Send a command, stripping UniFi log noise before any TextFSM parsing."""
         textfsm_template = map_textfsm_template(command, platform="ubiquiti_unifi")
-        return self._netmiko_device.send_command(
+
+        # Always fetch raw output first so we can clean it before TextFSM sees it
+        raw = self._netmiko_device.send_command(
             command,
-            use_textfsm=(textfsm_template is not None),
-            textfsm_template=textfsm_template,
+            use_textfsm=False,
             read_timeout=60,
         )
+        clean = strip_unifi_log_lines(raw)
+
+        if textfsm_template is not None:
+            return get_structured_data_textfsm(clean, template=textfsm_template)
+        return clean
 
     def is_physical_interface(self, interface_name) -> bool:
         output = self.send_command(f"readlink -f /sys/class/net/{interface_name}")
@@ -172,7 +197,7 @@ class UnifiBaseDriver(NetworkDriver, ABC):
                 "is_up": "UP" in flags,
                 "last_flapped": float(-1),
                 "mac_address": record["mac_address"],
-                "mtu": record["mtu"],
+                "mtu": int(record["mtu"]),          # TextFSM returns strings; cast to int
                 "speed": float(-1),
                 "type": "virtual" if self.is_physical_interface(interface_name) else record["type"],
             }
@@ -181,7 +206,7 @@ class UnifiBaseDriver(NetworkDriver, ABC):
                     device_path = f"/sys/class/net/{interface_name}"
                     interfaces[interface_name]["speed"] = float(self._read_file(f"{device_path}/speed"))
                 except ValueError:
-                    """Ignore bad speed parsing."""
+                    pass  # Ignore bad speed parsing
         return interfaces
 
 
@@ -199,7 +224,7 @@ class UnifiConfigMixin:
                 if line.startswith("."):
                     line = line.removeprefix(".")
                 if group:
-                    keys, value = line.split("=")
+                    keys, value = line.split("=", 1)  # maxsplit=1 guards against values containing "="
                     keys = keys.split(".")
                     node = section
                     for key in keys[0:-1]:
@@ -215,7 +240,9 @@ class UnifiConfigMixin:
         for line in config.splitlines():
             if line.strip().startswith("#"):
                 continue
-            line_key, value = line.split("=")
+            if "=" not in line:
+                continue  # Guard against malformed lines
+            line_key, value = line.split("=", 1)  # maxsplit=1 guards against values containing "="
             if line_key == key:
                 return value
         raise KeyError(key)
@@ -265,7 +292,7 @@ class NoEnableMixin:
 
 class UnifiSwitchBase(NoEnableMixin, UnifiConfigMixin, UnifiBaseDriver):
 
-    def cli(self, commands: List[str], use_texfsm = False) -> Dict[str, Union[str, Dict[str, Any]]]:
+    def cli(self, commands: List[str], use_texfsm=False) -> Dict[str, Union[str, Dict[str, Any]]]:
         self._netmiko_device.send_command("cli", expect_string=r"[^\#\>]+\s*[\#\>]")
         self._netmiko_device.send_command("enable", expect_string=r"[\$\#\>]\s*$")
         self._netmiko_device.send_command("terminal length 0", expect_string=r"[\$\#\>]\s*$")
@@ -317,7 +344,6 @@ class UnifiSwitchBase(NoEnableMixin, UnifiConfigMixin, UnifiBaseDriver):
         output = self._get_lldp_neighbors()
         for neighbor in output:
             interface_name = neighbor["local_port"]
-
             neighbors[interface_name].append(
                 {
                     "hostname": neighbor["system_name"],
@@ -329,25 +355,30 @@ class UnifiSwitchBase(NoEnableMixin, UnifiConfigMixin, UnifiBaseDriver):
     def get_ports(self) -> Dict[str, models.InterfaceDict]:
         ports: Dict[str, models.InterfaceDict] = {}
         mtu = 1500
-        mca = json.loads(self._netmiko_device.send_command("mca-dump"))
+        raw = self._netmiko_device.send_command("mca-dump", read_timeout=60)
+        mca = parse_mca_dump(raw)
 
-        if self.get_config_value("switch.jumboframes") == "enabled":
-            mtu = int(self.get_config_value("switch.mtu"))
+        try:
+            if self.get_config_value("switch.jumboframes") == "enabled":
+                mtu = int(self.get_config_value("switch.mtu"))
+        except KeyError:
+            pass  # Jumbo frames not configured, stick with 1500
 
         for port, details in self.get_config_section("switch.port", group=True, trim=True).items():
-            status = mca["port_table"][int(port)-1]
-            enabled = True
-            if details.get("status") == "disabled":
-                enabled = False
+            try:
+                status = mca["port_table"][int(port) - 1]
+            except (IndexError, KeyError):
+                continue  # port_table shorter than config, skip gracefully
+            enabled = details.get("status") != "disabled"
             port = f"Port {port}"
             ports[port] = {
-                "description": details["name"],
+                "description": details.get("name", ""),
                 "is_enabled": enabled,
                 "is_up": status["up"],
                 "last_flapped": float(-1),
                 "mac_address": None,
-                "mtu": mtu,
-                "speed": float(status["speed"]),
+                "mtu": int(mtu),
+                "speed": float(status.get("speed", -1)),
                 "type": "ether",
                 "alias": "",
             }
