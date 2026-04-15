@@ -244,7 +244,9 @@ class UnifiConfigMixin:
             section = {}
         else:
             section = []
-        config: str = self._get_config("running", use_previous=True)["running"]
+        config = self._get_config("running", use_previous=True)["running"]
+        if not isinstance(config, str):
+            return section
         for line in config.splitlines():
             if line.startswith(prefix):
                 if trim:
@@ -264,7 +266,9 @@ class UnifiConfigMixin:
         return section
 
     def get_config_value(self, key: str) -> str:
-        config: str = self._get_config("running", use_previous=True)["running"]
+        config = self._get_config("running", use_previous=True)["running"]
+        if not isinstance(config, str):
+            raise KeyError(key)
         for line in config.splitlines():
             if line.strip().startswith("#"):
                 continue
